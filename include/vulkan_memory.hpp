@@ -37,8 +37,8 @@ namespace vulkanfs {
             friend block_ref allocate();
 
         public:
-            // 512 KiB blocks reduce per-submission overhead vs 128 KiB
-            static const size_t size = 512 * 1024;
+            // FUSE >=3.6.0 max_write size is 1 MiB blocks 
+            static const size_t size = 1024 * 1024;
 
             block(const block& other) = delete;
 

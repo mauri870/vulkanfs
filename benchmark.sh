@@ -23,6 +23,6 @@ cleanup() {
 trap cleanup EXIT
 
 echo "==> Writing 1G file with dd..."
-dd if=/dev/zero of="$TEST_FILE" bs=1M count=1024 conv=fsync status=progress
+dd if=/dev/zero of="$TEST_FILE" bs=1M count=1024 status=progress
 
 echo "==> Benchmark complete."

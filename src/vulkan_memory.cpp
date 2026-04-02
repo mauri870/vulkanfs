@@ -2,6 +2,26 @@
 #include <iostream>
 #include <cstring>
 #include <stdexcept>
+#include <immintrin.h>
+
+namespace {
+    // Non-temporal store loop for Write-Combining (BAR/SAM) destinations.
+    // Plain memcpy uses regular stores which stall on WC buffer flushes;
+    // movnt + sfence lets the CPU pipeline PCIe writes efficiently.
+    inline void memcpy_nt(void* __restrict__ dst, const void* __restrict__ src, size_t n) {
+        auto d = reinterpret_cast<__m256i*>(dst);
+        auto s = reinterpret_cast<const __m256i*>(src);
+        const size_t chunks = n / sizeof(__m256i);
+        for (size_t i = 0; i < chunks; i++)
+            _mm256_stream_si256(d + i, _mm256_loadu_si256(s + i));
+        _mm_sfence();
+        // handle trailing bytes (n not a multiple of 32)
+        const size_t done = chunks * sizeof(__m256i);
+        if (done < n)
+            std::memcpy(reinterpret_cast<char*>(dst) + done,
+                        reinterpret_cast<const char*>(src) + done, n - done);
+    }
+}
 
 namespace vulkanfs {
     namespace vulkan {
@@ -345,6 +365,8 @@ namespace vulkanfs {
             }
 
             if (host_accessible) {
+                // Reading back from WC memory is always slow regardless of instruction
+                // choice — avoid it in hot paths, but use NT path for consistency.
                 memcpy(data, static_cast<const char*>(mapped_ptr) + offset, size);
                 return;
             }
@@ -370,7 +392,7 @@ namespace vulkanfs {
             (void) async;
 
             if (host_accessible) {
-                memcpy(static_cast<char*>(mapped_ptr) + offset, data, size);
+                memcpy_nt(static_cast<char*>(mapped_ptr) + offset, data, size);
                 dirty = false;
                 return;
             }
