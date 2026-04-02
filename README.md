@@ -18,6 +18,8 @@ make
 
 ## Usage
 
+> NOTE: Each file pre-allocates a 1MB VRAM block, so it does not scale linearly with file sizes.
+
 ```bash
 # Create mount point
 mkdir -p /tmp/vulkanfs
