@@ -8,7 +8,21 @@ namespace {
     // Non-temporal store loop for Write-Combining (BAR/SAM) destinations.
     // Plain memcpy uses regular stores which stall on WC buffer flushes;
     // movnt + sfence lets the CPU pipeline PCIe writes efficiently.
+    //
+    // _mm256_stream_si256 requires 32-byte-aligned destination. Writes to
+    // arbitrary file offsets may land at unaligned positions within the mapped
+    // buffer, so we copy an unaligned prefix with plain memcpy first.
     inline void memcpy_nt(void* __restrict__ dst, const void* __restrict__ src, size_t n) {
+        // Align dst to 32 bytes before starting NT stores.
+        size_t prefix = (32 - ((uintptr_t)dst & 31)) & 31;
+        if (prefix > n) prefix = n;
+        if (prefix) {
+            std::memcpy(dst, src, prefix);
+            dst = static_cast<char*>(dst) + prefix;
+            src = static_cast<const char*>(src) + prefix;
+            n  -= prefix;
+        }
+
         auto d = reinterpret_cast<__m256i*>(dst);
         auto s = reinterpret_cast<const __m256i*>(src);
         const size_t chunks = n / sizeof(__m256i);
