@@ -8,6 +8,9 @@
 
 namespace vulkanfs {
     namespace vulkan {
+        // Forward declaration — defined in vulkan_memory.cpp
+        struct Segment;
+
         class block;
         typedef std::shared_ptr<block> block_ref;
 
@@ -20,7 +23,7 @@ namespace vulkanfs {
         // Returns a list of device names
         std::vector<std::string> list_devices();
 
-        // Total blocks and blocks currently free
+        // Total blocks and blocks currently free (in block::size units)
         int pool_size();
         int pool_available();
 
@@ -31,14 +34,18 @@ namespace vulkanfs {
         block_ref allocate();
 
         /*
-         * Block of allocated VRAM
+         * A logical sub-block within a VRAM segment.
+         *
+         * Each Vulkan allocation is 1 MiB (the Segment). A Segment is subdivided
+         * into (1 MiB / block::size) sub-blocks. A block is a handle to one
+         * sub-block; the underlying Vulkan resources are shared through Segment.
          */
         class block : public std::enable_shared_from_this<block> {
             friend block_ref allocate();
 
         public:
-            // FUSE >=3.6.0 max_write size is 1 MiB blocks 
-            static const size_t size = 1024 * 1024;
+            // Logical block size (sub-block granularity, also the FUSE max_write size)
+            static const size_t size = 64 * 1024;
 
             block(const block& other) = delete;
 
@@ -53,30 +60,14 @@ namespace vulkanfs {
             void sync();
 
         private:
-            VkBuffer buffer;
-            VkDeviceMemory memory;
+            Segment* _segment;
+            size_t   _sub_block_index;
 
-            // When true (resizable BAR / AMD Smart Access Memory): the main buffer is
-            // DEVICE_LOCAL | HOST_VISIBLE, kept permanently mapped via mapped_ptr.
-            // Reads and writes become plain memcpy — no GPU command submission needed.
-            bool host_accessible = false;
-            void* mapped_ptr = nullptr;   // valid only when host_accessible
-
-            // Staging path — only populated when !host_accessible:
-            VkCommandPool    command_pool    = VK_NULL_HANDLE;
-            VkFence          fence           = VK_NULL_HANDLE;
-            VkCommandBuffer  command_buffer  = VK_NULL_HANDLE;
-            VkBuffer         staging_buffer  = VK_NULL_HANDLE;
-            VkDeviceMemory   staging_memory  = VK_NULL_HANDLE;
-            void*            staging_mapped  = nullptr;
-
-            // True until first write (until then it contains leftover data from last use)
+            // True until the first write in this allocation lifetime.
+            // Reads before any write return zeros rather than leaking old data.
             bool dirty = true;
 
-            block();
-            
-            void create_command_buffer();
-            void submit_command(VkCommandBuffer cmd, bool wait = true);
+            block(Segment* seg, size_t index);
         };
 
         // Global Vulkan state
@@ -87,10 +78,9 @@ namespace vulkanfs {
             VkQueue transfer_queue;
             uint32_t transfer_queue_family;
 
-            // Memory properties
             VkPhysicalDeviceMemoryProperties memory_properties;
             uint32_t memory_type_index;
-            
+
             bool initialized = false;
         };
 

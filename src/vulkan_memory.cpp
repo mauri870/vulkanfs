@@ -31,17 +31,51 @@ namespace vulkanfs {
 
         // True when blocks are DEVICE_LOCAL|HOST_VISIBLE (resizable BAR / SAM).
         // Set once on the first increase_pool() call; controls which I/O path is used.
-        bool g_host_accessible = false;
+        static bool g_host_accessible = false;
 
-        struct PoolEntry {
-            VkBuffer       buffer;
-            VkDeviceMemory memory;
-            void*          mapped; // non-null only for host-accessible allocations
+        // Each Segment is one 1 MiB Vulkan allocation, subdivided into sub-blocks.
+        static constexpr size_t segment_size      = 1024 * 1024;
+        static constexpr size_t blocks_per_segment = segment_size / block::size;
+
+        // A Segment owns all Vulkan resources for a 1 MiB allocation and tracks
+        // which sub-blocks are free via a bitmask (bit i = 1 → sub-block i is free).
+        struct Segment {
+            VkBuffer       buffer  = VK_NULL_HANDLE;
+            VkDeviceMemory memory  = VK_NULL_HANDLE;
+            void*          mapped  = nullptr;   // non-null only for host-accessible allocations
+
+            // Staging path — only populated when !g_host_accessible:
+            VkCommandPool   command_pool   = VK_NULL_HANDLE;
+            VkFence         fence          = VK_NULL_HANDLE;
+            VkCommandBuffer command_buffer = VK_NULL_HANDLE;
+            VkBuffer        staging_buffer = VK_NULL_HANDLE;
+            VkDeviceMemory  staging_memory = VK_NULL_HANDLE;
+            void*           staging_mapped = nullptr;
+
+            // Bitmask: bit i = 1 means sub-block i is free.
+            // blocks_per_segment = 16, so uint32_t is sufficient.
+            uint32_t free_bitmap = (1u << blocks_per_segment) - 1u;
+            size_t   free_count  = blocks_per_segment;
+
+            int allocate_sub_block() {
+                if (free_count == 0) return -1;
+                int idx = __builtin_ctz(free_bitmap);
+                free_bitmap &= ~(1u << idx);
+                free_count--;
+                return idx;
+            }
+
+            void free_sub_block(size_t idx) {
+                free_bitmap |= (1u << idx);
+                free_count++;
+            }
         };
-        std::vector<PoolEntry> pool;
-        int total_blocks = 0;
 
-        size_t device_num = 0;
+        // All segments, allocated at startup and never freed during runtime.
+        static std::vector<Segment*> segments;
+        static int total_sub_blocks = 0;
+
+        static size_t device_num = 0;
 
         static void check_vk_result(VkResult result, const char* op) {
             if (result != VK_SUCCESS)
@@ -180,27 +214,69 @@ namespace vulkanfs {
         }
 
         int pool_size() {
-            return total_blocks;
+            return total_sub_blocks;
         }
 
         int pool_available() {
-            return pool.size();
+            int free = 0;
+            for (const auto* seg : segments)
+                free += (int)seg->free_count;
+            return free;
+        }
+
+        // Create the staging buffer + command pool/buffer/fence for the non-BAR path.
+        static void create_segment_staging(Segment* seg) {
+            VkCommandPoolCreateInfo pool_info{};
+            pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
+            pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+            pool_info.queueFamilyIndex = g_state.transfer_queue_family;
+            check_vk_result(vkCreateCommandPool(g_state.device, &pool_info, nullptr, &seg->command_pool), "vkCreateCommandPool");
+
+            VkCommandBufferAllocateInfo alloc_info{};
+            alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+            alloc_info.commandPool = seg->command_pool;
+            alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+            alloc_info.commandBufferCount = 1;
+            check_vk_result(vkAllocateCommandBuffers(g_state.device, &alloc_info, &seg->command_buffer), "vkAllocateCommandBuffers");
+
+            VkFenceCreateInfo fence_info{};
+            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+            check_vk_result(vkCreateFence(g_state.device, &fence_info, nullptr, &seg->fence), "vkCreateFence");
+
+            // Persistent host-visible staging buffer sized to one sub-block.
+            // Only one sub-block is transferred at a time (serialised by fsmutex).
+            VkBufferCreateInfo staging_info{};
+            staging_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
+            staging_info.size = block::size;
+            staging_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+            staging_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+            check_vk_result(vkCreateBuffer(g_state.device, &staging_info, nullptr, &seg->staging_buffer), "vkCreateBuffer (staging)");
+
+            VkMemoryRequirements staging_req;
+            vkGetBufferMemoryRequirements(g_state.device, seg->staging_buffer, &staging_req);
+
+            VkMemoryAllocateInfo staging_alloc{};
+            staging_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
+            staging_alloc.allocationSize = staging_req.size;
+            staging_alloc.memoryTypeIndex = find_memory_type(staging_req.memoryTypeBits,
+                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+            check_vk_result(vkAllocateMemory(g_state.device, &staging_alloc, nullptr, &seg->staging_memory), "vkAllocateMemory (staging)");
+            check_vk_result(vkBindBufferMemory(g_state.device, seg->staging_buffer, seg->staging_memory, 0), "vkBindBufferMemory (staging)");
+            check_vk_result(vkMapMemory(g_state.device, seg->staging_memory, 0, block::size, 0, &seg->staging_mapped), "vkMapMemory (staging)");
         }
 
         size_t increase_pool(size_t size) {
             if (!init_vulkan()) return 0;
 
-            int block_count = 1 + (size - 1) / block::size;
+            int segment_count = (int)(1 + (size - 1) / segment_size);
 
             std::lock_guard<std::mutex> lock(g_vulkan_mutex);
 
             // On the first call, probe for resizable BAR (NVIDIA) / Smart Access Memory (AMD).
-            // If the GPU exposes DEVICE_LOCAL|HOST_VISIBLE memory we can skip the staging
-            // buffer entirely and just memcpy directly into VRAM.
-            if (total_blocks == 0) {
+            if (total_sub_blocks == 0) {
                 VkBufferCreateInfo probe_info{};
                 probe_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-                probe_info.size = block::size;
+                probe_info.size = segment_size;
                 probe_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
                 probe_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
@@ -228,190 +304,135 @@ namespace vulkanfs {
                    VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)
                 : VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
 
-            for (int i = 0; i < block_count; i++) {
+            for (int i = 0; i < segment_count; i++) {
                 try {
+                    Segment* seg = new Segment();
+
                     VkBufferCreateInfo buffer_info{};
                     buffer_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-                    buffer_info.size = block::size;
+                    buffer_info.size = segment_size;
                     buffer_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
                     buffer_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 
-                    VkBuffer buffer;
-                    check_vk_result(vkCreateBuffer(g_state.device, &buffer_info, nullptr, &buffer), "vkCreateBuffer");
+                    check_vk_result(vkCreateBuffer(g_state.device, &buffer_info, nullptr, &seg->buffer), "vkCreateBuffer");
 
                     VkMemoryRequirements mem_requirements;
-                    vkGetBufferMemoryRequirements(g_state.device, buffer, &mem_requirements);
+                    vkGetBufferMemoryRequirements(g_state.device, seg->buffer, &mem_requirements);
 
                     VkMemoryAllocateInfo alloc_info{};
                     alloc_info.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
                     alloc_info.allocationSize = mem_requirements.size;
                     alloc_info.memoryTypeIndex = find_memory_type(mem_requirements.memoryTypeBits, mem_flags);
 
-                    VkDeviceMemory memory;
-                    check_vk_result(vkAllocateMemory(g_state.device, &alloc_info, nullptr, &memory), "vkAllocateMemory");
-                    check_vk_result(vkBindBufferMemory(g_state.device, buffer, memory, 0), "vkBindBufferMemory");
+                    check_vk_result(vkAllocateMemory(g_state.device, &alloc_info, nullptr, &seg->memory), "vkAllocateMemory");
+                    check_vk_result(vkBindBufferMemory(g_state.device, seg->buffer, seg->memory, 0), "vkBindBufferMemory");
 
-                    void* mapped = nullptr;
                     if (g_host_accessible)
-                        check_vk_result(vkMapMemory(g_state.device, memory, 0, block::size, 0, &mapped), "vkMapMemory (pool)");
+                        check_vk_result(vkMapMemory(g_state.device, seg->memory, 0, segment_size, 0, &seg->mapped), "vkMapMemory (segment)");
+                    else
+                        create_segment_staging(seg);
 
-                    pool.push_back({buffer, memory, mapped});
-                    total_blocks++;
+                    segments.push_back(seg);
+                    total_sub_blocks += (int)blocks_per_segment;
 
                 } catch (const std::exception& e) {
-                    std::cerr << "Failed to allocate block: " << e.what() << std::endl;
-                    return i * block::size;
+                    std::cerr << "Failed to allocate segment: " << e.what() << std::endl;
+                    return (size_t)i * segment_size;
                 }
             }
 
-            return block_count * block::size;
+            return (size_t)segment_count * segment_size;
         }
 
         block_ref allocate() {
             std::lock_guard<std::mutex> lock(g_vulkan_mutex);
-            if (!pool.empty())
-                return block_ref(new block());
+            for (auto* seg : segments) {
+                int idx = seg->allocate_sub_block();
+                if (idx >= 0)
+                    return block_ref(new block(seg, (size_t)idx));
+            }
             return nullptr;
         }
 
-        block::block() {
-            if (pool.empty())
-                throw std::runtime_error("No blocks available in pool");
-
-            auto entry = pool.back();
-            pool.pop_back();
-
-            buffer          = entry.buffer;
-            memory          = entry.memory;
-            host_accessible = g_host_accessible;
-            mapped_ptr      = entry.mapped;
-
-            if (!host_accessible)
-                create_command_buffer();
-        }
+        block::block(Segment* seg, size_t index)
+            : _segment(seg), _sub_block_index(index) {}
 
         block::~block() {
             std::lock_guard<std::mutex> lock(g_vulkan_mutex);
-            pool.push_back({buffer, memory, mapped_ptr});
-
-            if (!host_accessible) {
-                vkUnmapMemory(g_state.device, staging_memory);
-                vkDestroyBuffer(g_state.device, staging_buffer, nullptr);
-                vkFreeMemory(g_state.device, staging_memory, nullptr);
-                vkDestroyCommandPool(g_state.device, command_pool, nullptr); // frees command_buffer implicitly
-                vkDestroyFence(g_state.device, fence, nullptr);
-            }
+            _segment->free_sub_block(_sub_block_index);
         }
 
-        void block::create_command_buffer() {
-            VkCommandPoolCreateInfo pool_info{};
-            pool_info.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
-            pool_info.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
-            pool_info.queueFamilyIndex = g_state.transfer_queue_family;
-            check_vk_result(vkCreateCommandPool(g_state.device, &pool_info, nullptr, &command_pool), "vkCreateCommandPool");
-
-            VkCommandBufferAllocateInfo alloc_info{};
-            alloc_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
-            alloc_info.commandPool = command_pool;
-            alloc_info.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-            alloc_info.commandBufferCount = 1;
-            check_vk_result(vkAllocateCommandBuffers(g_state.device, &alloc_info, &command_buffer), "vkAllocateCommandBuffers");
-
-            VkFenceCreateInfo fence_info{};
-            fence_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
-            check_vk_result(vkCreateFence(g_state.device, &fence_info, nullptr, &fence), "vkCreateFence");
-
-            // Persistent host-visible staging buffer, kept permanently mapped.
-            // Avoids a vkAllocateMemory round-trip on every read/write.
-            VkBufferCreateInfo staging_info{};
-            staging_info.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO;
-            staging_info.size = block::size;
-            staging_info.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
-            staging_info.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-            check_vk_result(vkCreateBuffer(g_state.device, &staging_info, nullptr, &staging_buffer), "vkCreateBuffer (staging)");
-
-            VkMemoryRequirements staging_req;
-            vkGetBufferMemoryRequirements(g_state.device, staging_buffer, &staging_req);
-
-            VkMemoryAllocateInfo staging_alloc{};
-            staging_alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-            staging_alloc.allocationSize = staging_req.size;
-            staging_alloc.memoryTypeIndex = find_memory_type(staging_req.memoryTypeBits,
-                VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
-            check_vk_result(vkAllocateMemory(g_state.device, &staging_alloc, nullptr, &staging_memory), "vkAllocateMemory (staging)");
-            check_vk_result(vkBindBufferMemory(g_state.device, staging_buffer, staging_memory, 0), "vkBindBufferMemory (staging)");
-            check_vk_result(vkMapMemory(g_state.device, staging_memory, 0, block::size, 0, &staging_mapped), "vkMapMemory (staging)");
-        }
-
-        void block::submit_command(VkCommandBuffer cmd, bool wait) {
+        static void submit_command(Segment* seg, bool wait) {
             VkSubmitInfo submit_info{};
             submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
             submit_info.commandBufferCount = 1;
-            submit_info.pCommandBuffers = &cmd;
+            submit_info.pCommandBuffers = &seg->command_buffer;
 
-            check_vk_result(vkQueueSubmit(g_state.transfer_queue, 1, &submit_info, fence), "vkQueueSubmit");
+            check_vk_result(vkQueueSubmit(g_state.transfer_queue, 1, &submit_info, seg->fence), "vkQueueSubmit");
 
             if (wait) {
-                check_vk_result(vkWaitForFences(g_state.device, 1, &fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
-                check_vk_result(vkResetFences(g_state.device, 1, &fence), "vkResetFences");
+                check_vk_result(vkWaitForFences(g_state.device, 1, &seg->fence, VK_TRUE, UINT64_MAX), "vkWaitForFences");
+                check_vk_result(vkResetFences(g_state.device, 1, &seg->fence), "vkResetFences");
             }
         }
 
         void block::read(off_t offset, size_t size, void* data) const {
             if (dirty) {
-                // Never written — return zeros rather than leaking data from a prior pool user.
+                // Never written — return zeros to avoid leaking data from a prior use.
                 memset(data, 0, size);
                 return;
             }
 
-            if (host_accessible) {
-                // Reading back from WC memory is always slow regardless of instruction
-                // choice — avoid it in hot paths, but use NT path for consistency.
-                memcpy(data, static_cast<const char*>(mapped_ptr) + offset, size);
+            off_t abs_offset = (off_t)_sub_block_index * (off_t)block::size + offset;
+
+            if (g_host_accessible) {
+                memcpy(data, static_cast<const char*>(_segment->mapped) + abs_offset, size);
                 return;
             }
 
             VkCommandBufferBeginInfo begin_info{};
             begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            check_vk_result(vkResetCommandBuffer(command_buffer, 0), "vkResetCommandBuffer");
-            check_vk_result(vkBeginCommandBuffer(command_buffer, &begin_info), "vkBeginCommandBuffer");
+            check_vk_result(vkResetCommandBuffer(_segment->command_buffer, 0), "vkResetCommandBuffer");
+            check_vk_result(vkBeginCommandBuffer(_segment->command_buffer, &begin_info), "vkBeginCommandBuffer");
 
             VkBufferCopy copy_region{};
-            copy_region.srcOffset = offset;
+            copy_region.srcOffset = (VkDeviceSize)abs_offset;
             copy_region.dstOffset = 0;
-            copy_region.size = size;
-            vkCmdCopyBuffer(command_buffer, buffer, staging_buffer, 1, &copy_region);
+            copy_region.size      = size;
+            vkCmdCopyBuffer(_segment->command_buffer, _segment->buffer, _segment->staging_buffer, 1, &copy_region);
 
-            check_vk_result(vkEndCommandBuffer(command_buffer), "vkEndCommandBuffer");
-            const_cast<block*>(this)->submit_command(command_buffer, true);
+            check_vk_result(vkEndCommandBuffer(_segment->command_buffer), "vkEndCommandBuffer");
+            submit_command(_segment, true);
 
-            memcpy(data, staging_mapped, size);
+            memcpy(data, _segment->staging_mapped, size);
         }
 
         void block::write(off_t offset, size_t size, const void* data, bool async) {
-            (void) async;
+            (void)async;
 
-            if (host_accessible) {
-                memcpy_nt(static_cast<char*>(mapped_ptr) + offset, data, size);
+            off_t abs_offset = (off_t)_sub_block_index * (off_t)block::size + offset;
+
+            if (g_host_accessible) {
+                memcpy_nt(static_cast<char*>(_segment->mapped) + abs_offset, data, size);
                 dirty = false;
                 return;
             }
 
-            memcpy(staging_mapped, data, size);
+            memcpy(_segment->staging_mapped, data, size);
 
             VkCommandBufferBeginInfo begin_info{};
             begin_info.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-            check_vk_result(vkResetCommandBuffer(command_buffer, 0), "vkResetCommandBuffer");
-            check_vk_result(vkBeginCommandBuffer(command_buffer, &begin_info), "vkBeginCommandBuffer");
+            check_vk_result(vkResetCommandBuffer(_segment->command_buffer, 0), "vkResetCommandBuffer");
+            check_vk_result(vkBeginCommandBuffer(_segment->command_buffer, &begin_info), "vkBeginCommandBuffer");
 
             VkBufferCopy copy_region{};
             copy_region.srcOffset = 0;
-            copy_region.dstOffset = offset;
-            copy_region.size = size;
-            vkCmdCopyBuffer(command_buffer, staging_buffer, buffer, 1, &copy_region);
+            copy_region.dstOffset = (VkDeviceSize)abs_offset;
+            copy_region.size      = size;
+            vkCmdCopyBuffer(_segment->command_buffer, _segment->staging_buffer, _segment->buffer, 1, &copy_region);
 
-            check_vk_result(vkEndCommandBuffer(command_buffer), "vkEndCommandBuffer");
-            submit_command(command_buffer, true);
+            check_vk_result(vkEndCommandBuffer(_segment->command_buffer), "vkEndCommandBuffer");
+            submit_command(_segment, true);
 
             dirty = false;
         }
